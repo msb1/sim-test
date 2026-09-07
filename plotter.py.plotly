@@ -1,0 +1,214 @@
+"""Plot IoT sensor datasets and anomaly results from RustFS with Plotly WebGL."""
+
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import s3fs
+from plotly.subplots import make_subplots
+
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://192.168.1.50:9000")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "iotsim")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "access")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "secret")
+S3_PROCESSED_KEY = "processed/water_hammer-2026-08-30T00:00:00Z.parquet"
+S3_RESULTS_KEY = "results/"
+HAS_RESULTS = False
+ANOMALY_THRESHOLD = 3.5
+PLOT_COLORS = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#F0E442"]
+DOWNSAMPLING_INTERVAL = None  # e.g. "1min"
+MIN_PEAK_HEIGHT = 300
+
+
+def rustfs() -> s3fs.S3FileSystem:
+    """Create a path-style RustFS client using iot-sim defaults."""
+    return s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={"endpoint_url": S3_ENDPOINT_URL},
+    )
+
+
+def read_parquet(filesystem: s3fs.S3FileSystem, key: str) -> pd.DataFrame:
+    with filesystem.open(f"{S3_BUCKET_NAME}/{key}", "rb") as source:
+        return pd.read_parquet(source, engine="pyarrow")
+
+
+def anomaly_mask(frame: pd.DataFrame) -> pd.Series:
+    if "is_anomalous" not in frame:
+        return pd.Series(False, index=frame.index)
+    return frame["is_anomalous"].fillna(False).astype(bool)
+
+
+def _numeric_series(frame: pd.DataFrame, column: str) -> tuple[pd.Series, pd.Series]:
+    timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+    values = pd.to_numeric(frame[column], errors="coerce")
+    valid = timestamps.notna() & values.notna()
+    valid_timestamps = timestamps.loc[valid]
+    valid_values = values.loc[valid]
+    order = np.argsort(valid_timestamps.to_numpy(), kind="stable")
+    return valid_timestamps.iloc[order], valid_values.iloc[order]
+
+
+def _add_lines(fig: go.Figure, frame: pd.DataFrame, row: int, y_label: str) -> None:
+    """Add one WebGL line trace for every numeric, non-timestamp column."""
+    color_index = 0
+    for column in (column for column in frame.columns if column != "timestamp"):
+        timestamps, values = _numeric_series(frame, column)
+        if timestamps.empty:
+            continue
+        fig.add_trace(
+            go.Scattergl(
+                x=timestamps,
+                y=values,
+                mode="lines",
+                name=str(column),
+                line=dict(color=PLOT_COLORS[color_index % len(PLOT_COLORS)], width=1),
+                hovertemplate=f"{column}: %{{y}}<br>%{{x}}<extra></extra>",
+            ),
+            row=row,
+            col=1,
+        )
+        color_index += 1
+    fig.update_yaxes(title_text=y_label, row=row, col=1)
+
+
+def plot_metrics_and_anomalies(
+    dfs: pd.DataFrame, dfr: pd.DataFrame | None = None
+) -> go.Figure:
+    """Build and display synchronized Plotly WebGL sensor timelines.
+
+    The returned figure can be embedded in Dash, written to HTML, or shown
+    interactively. When anomaly results are supplied, their numeric columns
+    get a threshold line and red markers for values above it.
+    """
+    has_anomalies = dfr is not None
+    fig = make_subplots(
+        rows=2 if has_anomalies else 1,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=(
+            "IoT Sensor Metrics",
+            f"Anomaly Tracking (Threshold > {ANOMALY_THRESHOLD})",
+        ) if has_anomalies else ("IoT Sensor Metrics",),
+    )
+
+    _add_lines(fig, dfs, row=1, y_label="Sensors")
+
+    if dfr is not None:
+        _add_lines(fig, dfr, row=2, y_label="Anomaly Score")
+        fig.add_hline(
+            y=ANOMALY_THRESHOLD,
+            line_color="#D55E00",
+            line_dash="dash",
+            line_width=1,
+            annotation_text=f"Threshold ({ANOMALY_THRESHOLD})",
+            annotation_position="top left",
+            row=2,
+            col=1,
+        )
+        for column in (column for column in dfr.columns if column != "timestamp"):
+            timestamps, values = _numeric_series(dfr, column)
+            anomalous = values > ANOMALY_THRESHOLD
+            if not anomalous.any():
+                continue
+            fig.add_trace(
+                go.Scattergl(
+                    x=timestamps.loc[anomalous],
+                    y=values.loc[anomalous],
+                    mode="markers",
+                    name=f"{column} anomaly",
+                    marker=dict(color="#D55E00", size=7, symbol="circle"),
+                    hovertemplate=f"{column} anomaly: %{{y}}<br>%{{x}}<extra></extra>",
+                ),
+                row=2,
+                col=1,
+            )
+
+    fig.update_layout(
+        height=700 if has_anomalies else 400,
+        title="IoT Sensor Metrics" if not has_anomalies else "IoT Sensor Metrics & Anomaly Report",
+        template="plotly_white",
+        showlegend=True,
+        hovermode="x unified",
+        margin=dict(t=90, r=30, b=60, l=70),
+    )
+    # Use a date axis with daily ticks. Datetime values are serialized as
+    # Plotly dates rather than passing large nanosecond/microsecond epoch
+    # integers to the WebGL layer.
+    fig.update_xaxes(
+        type="date",
+        tickformat="%Y-%m-%d",
+        dtick=86_400_000.0,
+        title_text="Date",
+        row=2 if has_anomalies else 1,
+        col=1,
+    )
+    fig.show()
+    return fig
+
+
+def downsample(df: pd.DataFrame) -> pd.DataFrame:
+    if "timestamp" not in df.columns:
+        print("Dataframe is ill-formed; no timestamp column...")
+        return df
+
+    for column in (column for column in df.columns if column != "timestamp"):
+        values = pd.to_numeric(df[column], errors="coerce").dropna()
+        samples = values.to_numpy()
+        peaks = (samples[1:-1] > MIN_PEAK_HEIGHT) & (samples[1:-1] > samples[:-2]) & (samples[1:-1] > samples[2:])
+        print(f"Column {column} has {int(peaks.sum())} greater than {MIN_PEAK_HEIGHT}")
+
+    df = df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    df = df.dropna(subset=["timestamp"]).set_index("timestamp")
+    df_downsampled = df.resample(DOWNSAMPLING_INTERVAL).mean(numeric_only=True)
+    for column in df_downsampled.columns:
+        block_max = df[column].resample(DOWNSAMPLING_INTERVAL).max()
+        block_min = df[column].resample(DOWNSAMPLING_INTERVAL).min()
+        block_std = df[column].resample(DOWNSAMPLING_INTERVAL).std()
+        threshold = block_std.fillna(0) * 3
+        is_spike = ((block_max - df_downsampled[column]) > threshold) | (
+            (df_downsampled[column] - block_min) > threshold
+        )
+        chosen_spike = np.where(
+            block_max - df_downsampled[column] > df_downsampled[column] - block_min,
+            block_max,
+            block_min,
+        )
+        df_downsampled[column] = np.where(is_spike, chosen_spike, df_downsampled[column])
+    return df_downsampled.reset_index()
+
+
+def main() -> None:
+    filesystem = rustfs()
+    dfs = read_parquet(filesystem, S3_PROCESSED_KEY)
+    print(f"Number of rows in IOT Sensor Dataframe: {len(dfs)}")
+    print(dfs.describe())
+    print("--------------")
+    dfr: pd.DataFrame | None = None
+    if HAS_RESULTS:
+        dfr = read_parquet(filesystem, S3_RESULTS_KEY)
+        print(f"Number of rows in IOT Anomaly Dataframe: {len(dfr)}")
+        print(dfr.describe())
+        print("--------------")
+    if DOWNSAMPLING_INTERVAL is not None:
+        dfs = downsample(dfs)
+        print(f"Number of rows in IOT Sensor Dataframe after DOWNSAMPLING: {len(dfs)}")
+        print(dfs.describe())
+        print("--------------")
+        if HAS_RESULTS and dfr is not None:
+            dfr = downsample(dfr)
+            print(f"Number of rows in IOT Anomaly Dataframe after DOWNSAMPLING: {len(dfr)}")
+            print(dfr.describe())
+            print("--------------")
+
+    plot_metrics_and_anomalies(dfs, dfr)
+
+
+if __name__ == "__main__":
+    main()

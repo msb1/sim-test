@@ -1,0 +1,237 @@
+"""Plot iot-sim sensor datasets and optional anomaly-detect results with Rerun.
+
+Every input row is retained. Rerun receives one scalar time series per numeric
+sensor column, allowing large Parquet datasets to remain inspectable.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import rerun as rr
+import rerun.blueprint as rrb
+import s3fs
+from dotenv import load_dotenv
+
+load_dotenv()
+
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://192.168.1.50:9000").strip().strip('"').rstrip("/")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "iotsim")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "access")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "secret")
+S3_PROCESSED_KEY = "processed/water_hammer-2026-08-30T00:00:00Z.parquet"
+S3_RESULTS_KEY = "results/"
+HAS_RESULTS = False
+ANOMALY_THRESHOLD = 3.5
+DEFAULT_OUTPUT_PATH = Path(__file__).resolve().parent / "anomaly_report.rrd"
+
+
+def rustfs() -> s3fs.S3FileSystem:
+    """Create a path-style RustFS client using iot-sim defaults."""
+    return s3fs.S3FileSystem(
+        key=S3_ACCESS_KEY,
+        secret=S3_SECRET_KEY,
+        client_kwargs={"endpoint_url": S3_ENDPOINT_URL},
+        config_kwargs={
+            "connect_timeout": 10,
+            "read_timeout": 60,
+            "s3": {"addressing_style": "path"},
+        },
+    )
+
+
+def read_parquet(filesystem: s3fs.S3FileSystem, key: str) -> pd.DataFrame:
+    with filesystem.open(f"{S3_BUCKET_NAME}/{key}", "rb") as source:
+        return pd.read_parquet(source, engine="pyarrow")
+
+
+def anomaly_mask(frame: pd.DataFrame) -> pd.Series:
+    """Return explicit anomaly flags when available."""
+    for column in ("anomaly_flag", "is_anomalous"):
+        if column in frame:
+            return frame[column].fillna(False).astype(bool)
+    return pd.Series(False, index=frame.index)
+
+
+def _result_anomaly_mask(frame: pd.DataFrame) -> np.ndarray:
+    """Use source flags when present, otherwise use the score threshold."""
+    for column in ("anomaly_flag", "is_anomalous"):
+        if column in frame:
+            return frame[column].fillna(False).astype(bool).to_numpy()
+    return frame["anomaly_score"].to_numpy() > ANOMALY_THRESHOLD
+
+
+def _timestamp_nanos(frame: pd.DataFrame) -> np.ndarray:
+    """Return timestamps as UTC nanoseconds for Rerun's time index."""
+    timestamps = pd.to_datetime(frame["timestamp"])
+    if timestamps.dt.tz is not None:
+        timestamps = timestamps.dt.tz_convert("UTC")
+    return timestamps.astype("int64").to_numpy(dtype=np.int64)
+
+
+def _log_series(path: str, timestamps: np.ndarray, values: np.ndarray) -> None:
+    """Log a complete scalar series, preserving source row order."""
+    valid = ~pd.isna(values)
+    if not valid.any():
+        return
+    scalar_batch = rr.Scalars(np.asarray(values[valid], dtype=np.float64)).as_component_batches()[0]
+    rr.send_columns(
+        path,
+        indexes=[
+            rr.TimeColumn(
+                "log_time",
+                timestamp=timestamps[valid].astype("datetime64[ns]"),
+            )
+        ],
+        columns=[
+            scalar_batch.partition(
+                lengths=np.ones(int(valid.sum()), dtype=np.int32),
+            )
+        ],
+    )
+
+
+def _axis_max(values: np.ndarray, margin: float = 0.10) -> float:
+    """Return a positive upper axis bound with padding above finite values."""
+    numeric_values = np.asarray(values, dtype=np.float64)
+    finite_values = numeric_values[np.isfinite(numeric_values)]
+    if not finite_values.size:
+        return 1.0
+    return max(1.0, float(finite_values.max()) * (1.0 + margin))
+
+
+def _send_blueprint(
+    metric_ymax: float,
+    anomaly_ymax: float | None,
+) -> None:
+    views: list[rrb.View] = [
+        rrb.TimeSeriesView(
+            name="IoT Sensor Metrics",
+            origin="/metrics",
+            axis_y=rrb.ScalarAxis(range=(0.0, metric_ymax)),
+        ),
+    ]
+    if anomaly_ymax is not None:
+        views.append(
+            rrb.TimeSeriesView(
+                name="Anomaly Detection Model Output",
+                origin="/anomalies",
+                axis_y=rrb.ScalarAxis(range=(0.0, anomaly_ymax)),
+            )
+        )
+
+    rr.send_blueprint(
+        rrb.Blueprint(
+            rrb.Vertical(*views, row_shares=[1] * len(views)),
+            rrb.BlueprintPanel(state="collapsed"),
+            rrb.SelectionPanel(state="collapsed"),
+        )
+    )
+
+
+def plot_metrics_and_anomalies(
+    dfs: pd.DataFrame,
+    dfr: pd.DataFrame | None = None,
+    output_path: str | os.PathLike[str] | None = None,
+    show: bool = False,
+) -> Path | None:
+    """Stream all rows to Rerun and optionally save a standalone ``.rrd`` file.
+
+    ``show`` is opt-in so batch jobs do not start a viewer. Rerun recordings
+    contain the raw data and can be opened later with the Rerun viewer.
+    """
+    if dfs.empty or "timestamp" not in dfs:
+        raise ValueError("sensor data must contain at least one timestamp row")
+
+    dfs = dfs.sort_values(by="timestamp", kind="stable").reset_index(drop=True)
+    if dfr is not None:
+        if dfr.empty or "timestamp" not in dfr or "anomaly_score" not in dfr:
+            raise ValueError("result data must contain timestamp and anomaly_score")
+        dfr = dfr.sort_values(by="timestamp", kind="stable").reset_index(drop=True)
+
+    numeric_columns = [
+        column
+        for column in dfs.columns
+        if column != "timestamp" and pd.api.types.is_numeric_dtype(dfs[column])
+    ]
+    if not numeric_columns:
+        raise ValueError("sensor data must contain at least one numeric metric column")
+
+    metric_values = dfs[numeric_columns].to_numpy(dtype=np.float64).ravel()
+    metric_ymax = _axis_max(metric_values)
+    anomaly_ymax = (
+        _axis_max(dfr["anomaly_score"].to_numpy(dtype=np.float64))
+        if dfr is not None
+        else None
+    )
+
+    saved_path: Path | None = None
+    if output_path is not None:
+        saved_path = Path(output_path)
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rr.init("metrics_anomaly_viewer", spawn=show)
+    if saved_path is not None:
+        if show:
+            # rr.save() replaces the viewer sink installed by spawn=True.
+            # Install both sinks so the native canvas receives the live stream
+            # while the same data is retained in the project recording.
+            rr.set_sinks(rr.GrpcSink(), rr.FileSink(saved_path))
+        else:
+            rr.save(saved_path)
+
+    try:
+        _send_blueprint(metric_ymax, anomaly_ymax)
+
+        sensor_timestamps = _timestamp_nanos(dfs)
+        for column in numeric_columns:
+            _log_series(f"metrics/{column}", sensor_timestamps, dfs[column].to_numpy())
+
+        if dfr is not None:
+            result_timestamps = _timestamp_nanos(dfr)
+            scores = dfr["anomaly_score"].to_numpy()
+            _log_series("anomalies/score", result_timestamps, scores)
+            _log_series(
+                "anomalies/threshold",
+                result_timestamps,
+                np.full(len(dfr), ANOMALY_THRESHOLD),
+            )
+            flags = _result_anomaly_mask(dfr)
+            _log_series("anomalies/flag_triggered", result_timestamps[flags], scores[flags])
+    finally:
+        rr.disconnect()
+
+    if saved_path is not None:
+        print(f"Rerun recording saved to {saved_path}")
+    return saved_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--output", type=Path, default=DEFAULT_OUTPUT_PATH,
+        help="save a Rerun recording (default: project/anomaly_report.rrd)",
+    )
+    parser.add_argument("--show", action="store_true", help="also open the Rerun viewer")
+    args = parser.parse_args()
+
+    filesystem = rustfs()
+    df = read_parquet(filesystem, S3_PROCESSED_KEY)
+    print(df.describe())
+    print(df.dtypes)
+    if df.empty:
+        raise ValueError("no sensor rows remain after timestamp/metric filtering")
+
+    dfr: pd.DataFrame | None = None
+    if HAS_RESULTS:
+        dfr = read_parquet(filesystem, S3_RESULTS_KEY)
+
+    plot_metrics_and_anomalies(df, dfr, output_path=args.output, show=args.show)
+
+
+if __name__ == "__main__":
+    main()
